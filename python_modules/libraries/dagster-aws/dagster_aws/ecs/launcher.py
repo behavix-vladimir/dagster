@@ -5,7 +5,11 @@ import uuid
 import warnings
 from collections import namedtuple
 from collections.abc import Mapping, Sequence
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, cast
+
+if TYPE_CHECKING:
+    from mypy_boto3_ecs import ECSClient
+    from mypy_boto3_ecs.literals import RegionName
 
 import boto3
 from botocore.exceptions import ClientError
@@ -13,6 +17,7 @@ from dagster import (
     Array,
     DagsterRunStatus,
     Field,
+    Map,
     Noneable,
     Permissive,
     ScalarUnion,
@@ -59,7 +64,7 @@ from dagster_aws.ecs.utils import (
 )
 from dagster_aws.secretsmanager import get_secrets_from_arns
 
-Tags = namedtuple("Tags", ["arn", "cluster", "cpu", "memory"])
+Tags = namedtuple("Tags", ["arn", "cluster", "cpu", "memory", "region", "security_groups", "subnets", "assign_public_ip"])
 
 RUNNING_STATUSES = [
     "PROVISIONING",
@@ -101,6 +106,9 @@ class EcsRunLauncher(RunLauncher[T_DagsterInstance], ConfigurableClass):
         task_definition_prefix (str): If not provided, defaults to "run".
 
     """
+
+    _ecs_clients: dict["RegionName", "ECSClient"] = {}
+    _cross_region: Optional["RegionName"] = None
 
     def __init__(
         self,
@@ -235,6 +243,21 @@ class EcsRunLauncher(RunLauncher[T_DagsterInstance], ConfigurableClass):
 
         self._current_task_metadata = None
         self._current_task = None
+
+    def _get_ecs_client(self, region: Optional["RegionName"] = None) -> "ECSClient":
+        """Get or create an ECS client for the specified region.
+
+        Args:
+            region: Optional AWS region name.
+
+        Returns:
+            ECSClient
+        """
+        if region is None:
+            return self.ecs
+        elif region not in self._ecs_clients:
+            self._ecs_clients[region] = boto3.client("ecs", region_name=region)
+        return self._ecs_clients[region]
 
     @property
     def inst_data(self):
@@ -461,8 +484,12 @@ class EcsRunLauncher(RunLauncher[T_DagsterInstance], ConfigurableClass):
         cluster = tags.get("ecs/cluster")
         cpu = tags.get("ecs/cpu")
         memory = tags.get("ecs/memory")
+        region = tags.get("ecs/region")
+        security_groups = tags.get("ecs/security_groups")
+        subnets = tags.get("ecs/subnets")
+        assign_public_ip = tags.get("ecs/assign_public_ip")
 
-        return Tags(arn, cluster, cpu, memory)
+        return Tags(arn, cluster, cpu, memory, region, security_groups, subnets, assign_public_ip)
 
     def _get_command_args(self, run_args: ExecuteRunArgs, context: LaunchRunContext):
         return run_args.get_command_args()
@@ -477,12 +504,40 @@ class EcsRunLauncher(RunLauncher[T_DagsterInstance], ConfigurableClass):
         )
 
     def _run_task(self, **run_task_kwargs):
-        return run_ecs_task(self.ecs, run_task_kwargs)
+        def _tags_to_dict(tags: list[dict[str, str]]) -> dict[str, str]:
+            tags_dict = {}
+            for t in tags:
+                check.dict_param(t, "key", str)
+                check.dict_param(t, "value", str)
+                tags_dict[t.get("key")] = t.get("value")
+            return tags_dict
+
+        region = _tags_to_dict(run_task_kwargs.get("tags", [])).get("region", None)
+
+        return run_ecs_task(self._get_ecs_client(cast("RegionName", region)), run_task_kwargs)
 
     def launch_run(self, context: LaunchRunContext) -> None:
         """Launch a run in an ECS task."""
         run = context.dagster_run
         container_context = EcsContainerContext.create_for_run(run, self)
+
+        # TODO remove following if block after PR is merged to upstream
+        warnings.warn(f"run tags: ${run.tags}")
+        if run.tags and run.tags.get("ecs/region"):
+            self._regional = True
+            # self._regional = {
+            #     "eu-north-1": {
+            #         "assign_public_ip": "DISABLED",
+            #         "cluster": "arn:aws:ecs:eu-north-1:851725506399:cluster/dagster-compute-cluster-eu-north-1",
+            #         "security_groups": ["sg-0adcec1865a5b470f"],
+            #         "subnets": ["subnet-047d5fe22795a8008"],
+            #     }
+            # }
+            check.invariant("ecs/cluster" in run.tags, "Cross-region requires @job to specify 'ecs/cluster' tag")
+            check.invariant("ecs/security_groups" in run.tags, "Cross-region requires @job to specify 'ecs/security_groups' tag")
+            check.invariant("ecs/subnets" in run.tags, "Cross-region requires @job to specify 'ecs/subnets' tag")
+            check.invariant("ecs/assign_public_ip" in run.tags, "Cross-region requires @job to specify 'ecs/assign_public_ip' tag")
+            self._cross_region = cast("RegionName", run.tags["ecs/region"])
 
         job_origin = check.not_none(context.job_code_origin)
 
@@ -548,6 +603,19 @@ class EcsRunLauncher(RunLauncher[T_DagsterInstance], ConfigurableClass):
             and run_task_kwargs.get("networkConfiguration") is None
         ):
             del run_task_kwargs["networkConfiguration"]
+
+        if self._regional:
+            #please test if possible to get ecs tags directly as run.tags["ecs/region"] 
+            # or maybe they arrived to run_task_kwargs
+            run_task_kwargs["networkConfiguration"] = {
+                "awsvpcConfiguration": {
+                    "subnets": run.tags["ecs/subnets"].split(",")[0], # for starters let's take 1st element
+                    "securityGroups": run.tags["ecs/security_groups"].split(",")[0], # for starters let's take 1st element
+                    "assignPublicIp": "ENABLED" if run.tags["ecs/assign_public_ip"] else "DISABLED",
+                }
+            }
+            run_task_kwargs["cluster"] = run.tags["ecs/cluster"]
+            run_task_kwargs["tags"].append({"key": "region", "value": run.tags["ecs/region"]})
 
         # Run a task using the same network configuration as this processes's task.
         task = backoff(
@@ -639,7 +707,10 @@ class EcsRunLauncher(RunLauncher[T_DagsterInstance], ConfigurableClass):
         if not (tags.arn and tags.cluster):
             return False
 
-        tasks = self.ecs.describe_tasks(tasks=[tags.arn], cluster=tags.cluster).get("tasks")
+        ecs_client = (
+            self._get_ecs_client(tags.region) if tags.region else self.ecs
+        )
+        tasks = ecs_client.describe_tasks(tasks=[tags.arn], cluster=tags.cluster).get("tasks")
         if not tasks:
             return False
 
@@ -647,7 +718,7 @@ class EcsRunLauncher(RunLauncher[T_DagsterInstance], ConfigurableClass):
         if status == "STOPPED":
             return False
 
-        self.ecs.stop_task(task=tags.arn, cluster=tags.cluster)
+        ecs_client.stop_task(task=tags.arn, cluster=tags.cluster)
         return True
 
     def _get_current_task_metadata(self):
@@ -760,6 +831,18 @@ class EcsRunLauncher(RunLauncher[T_DagsterInstance], ConfigurableClass):
                     task_definition_dict,
                     self.get_container_name(container_context),
                 )
+                if (
+                    task_definition_config.log_configuration
+                    and "options" in task_definition_config.log_configuration
+                    and "awslogs-region" in task_definition_config.log_configuration["options"]
+                ):
+                    if self._cross_region:
+                        task_definition_config.log_configuration["options"]["awslogs-region"] = (
+                            self._cross_region
+                        )
+                        task_definition_config.log_configuration["options"][
+                            "awslogs-create-group"
+                        ] = "true"
 
             container_name = self.get_container_name(container_context)
 
@@ -801,12 +884,16 @@ class EcsRunLauncher(RunLauncher[T_DagsterInstance], ConfigurableClass):
         return {**task_kwargs, **self.run_task_kwargs, "taskDefinition": task_definition}
 
     def _reuse_task_definition(
-        self, desired_task_definition_config: DagsterEcsTaskDefinitionConfig, container_name: str
+        self,
+        desired_task_definition_config: DagsterEcsTaskDefinitionConfig,
+        container_name: str,
+        ecs: Optional["ECSClient"] = None,
     ):
         family = desired_task_definition_config.family
 
+        ecs_client = ecs if ecs else self.ecs
         try:
-            existing_task_definition = self.ecs.describe_task_definition(taskDefinition=family)[
+            existing_task_definition = ecs_client.describe_task_definition(taskDefinition=family)[
                 "taskDefinition"
             ]
         except ClientError:
@@ -825,8 +912,12 @@ class EcsRunLauncher(RunLauncher[T_DagsterInstance], ConfigurableClass):
         container_name: str,
         task_definition_dict: dict,
     ):
-        if not self._reuse_task_definition(desired_task_definition_config, container_name):
-            self.ecs.register_task_definition(**task_definition_dict)
+        ecs_client = self._get_ecs_client(self._cross_region) if self._cross_region else self.ecs
+
+        if not self._reuse_task_definition(
+            desired_task_definition_config, container_name, ecs_client
+        ):
+            ecs_client.register_task_definition(**task_definition_dict)
 
     def _environment(self, container_context):
         return [
@@ -864,7 +955,14 @@ class EcsRunLauncher(RunLauncher[T_DagsterInstance], ConfigurableClass):
         if not (tags.arn and tags.cluster):
             return CheckRunHealthResult(WorkerStatus.UNKNOWN, "", run_worker_id=run_worker_id)
 
-        tasks = self.ecs.describe_tasks(tasks=[tags.arn], cluster=tags.cluster).get("tasks")
+        if region := tags.region:
+            ecs_client = self._get_ecs_client(region)
+            logs_client = boto3.client("logs", region_name=region)
+        else:
+            ecs_client = self.ecs
+            logs_client = self.logs
+
+        tasks = ecs_client.describe_tasks(tasks=[tags.arn], cluster=tags.cluster).get("tasks")
         if not tasks:
             return CheckRunHealthResult(WorkerStatus.UNKNOWN, "", run_worker_id=run_worker_id)
 
@@ -874,7 +972,7 @@ class EcsRunLauncher(RunLauncher[T_DagsterInstance], ConfigurableClass):
             return CheckRunHealthResult(WorkerStatus.RUNNING, run_worker_id=run_worker_id)
         elif t.get("lastStatus") in STOPPED_STATUSES:
             failed_containers = []
-            for c in t.get("containers"):
+            for c in t.get("containers"):  # pyright: ignore [reportOptionalIterable]
                 if c.get("exitCode") != 0:
                     failed_containers.append(c)
             if len(failed_containers) > 0:
@@ -901,8 +999,8 @@ class EcsRunLauncher(RunLauncher[T_DagsterInstance], ConfigurableClass):
 
                 try:
                     logs = get_task_logs(
-                        self.ecs,
-                        logs_client=self.logs,
+                        ecs=ecs_client,
+                        logs_client=logs_client,
                         cluster=tags.cluster,
                         task_arn=tags.arn,
                         container_name=self.get_container_name(container_context),
@@ -916,7 +1014,7 @@ class EcsRunLauncher(RunLauncher[T_DagsterInstance], ConfigurableClass):
                 return CheckRunHealthResult(
                     WorkerStatus.FAILED,
                     failure_text,
-                    transient=self._is_transient_startup_failure(run, t),
+                    transient=self._is_transient_startup_failure(run, t),  # pyright: ignore [reportArgumentType]
                     run_worker_id=run_worker_id,
                 )
 

@@ -5,6 +5,7 @@ from dagster import (
     Array,
     BoolSource,
     Field,
+    Map,
     Noneable,
     Permissive,
     Shape,

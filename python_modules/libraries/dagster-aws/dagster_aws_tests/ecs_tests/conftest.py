@@ -11,8 +11,31 @@ def region():
 
 
 @pytest.fixture
+def xregion():
+    return "eu-central-1"
+
+@pytest.fixture
+def subnets():
+    return ",".join(["subnet-1", "subnet-2"])
+
+@pytest.fixture
+def security_groups():
+    return ",".join(["sec-gr-1"])
+
+
+@pytest.fixture
+def xregion_cluster_arn():
+    return "xregion-cluster-arn"
+
+
+@pytest.fixture
 def ecs(region):
     return ThreadsafeStubbedEcs(region_name=region)
+
+
+@pytest.fixture
+def ecs_xregion(xregion):
+    return ThreadsafeStubbedEcs(region_name=xregion)
 
 
 @pytest.fixture

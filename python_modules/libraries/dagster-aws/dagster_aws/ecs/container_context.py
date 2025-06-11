@@ -170,36 +170,6 @@ ECS_CONTAINER_CONTEXT_SCHEMA = {
         is_required=False,
         description="Name of the container in the task definition to use to run Dagster code.",
     ),
-    "regional": Field(
-        Map(
-            key_type=str,
-            inner_type=Shape(
-                {
-                    "cluster": Field(
-                        StringSource, is_required=True, description="ARN of the ECS cluster."
-                    ),
-                    "subnets": Field(
-                        Array(StringSource),
-                        is_required=True,
-                        description="List of subnet IDs (at least one required).",
-                    ),
-                    "security_groups": Field(
-                        Array(StringSource),
-                        is_required=True,
-                        description="List of security group IDs (at least one required).",
-                    ),
-                    "assign_public_ip": Field(
-                        StringSource,
-                        is_required=False,
-                        default_value="DISABLED",
-                        description="Whether to request the assignment of public IP.",
-                    ),
-                }
-            ),
-        ),
-        is_required=False,
-        description="Per-region cluster configuration. Each key must be an AWS region name.",
-    ),
     "server_resources": Field(
         Permissive(
             {

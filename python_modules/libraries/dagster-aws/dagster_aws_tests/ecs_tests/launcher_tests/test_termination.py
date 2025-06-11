@@ -18,14 +18,16 @@ def test_termination(instance, workspace, run):
 
 
 def test_termination_xregion(
-    instance_regional, workspace, job: JobDefinition, remote_job: RemoteJob, image: str, xregion
+    instance, workspace, job: JobDefinition, remote_job: RemoteJob, image: str, xregion, xregion_cluster_arn
 ):
-    instance = instance_regional
     run = instance.create_run_for_job(
         job,
         remote_job_origin=remote_job.get_remote_origin(),
         job_code_origin=remote_job.get_python_origin(),
-        tags={"region": xregion},
+        tags={
+            "ecs/region": xregion,
+            "ecs/cluster": xregion_cluster_arn,
+        },
     )
     workspace = in_process_test_workspace(
         instance,

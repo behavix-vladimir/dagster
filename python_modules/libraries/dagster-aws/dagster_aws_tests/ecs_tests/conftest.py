@@ -14,6 +14,14 @@ def region():
 def xregion():
     return "eu-central-1"
 
+@pytest.fixture
+def subnets():
+    return ",".join(["subnet-1", "subnet-2"])
+
+@pytest.fixture
+def security_groups():
+    return ",".join(["sec-gr-1"])
+
 
 @pytest.fixture
 def xregion_cluster_arn():

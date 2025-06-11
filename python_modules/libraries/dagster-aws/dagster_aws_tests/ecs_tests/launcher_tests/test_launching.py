@@ -281,12 +281,14 @@ def test_launcher_dont_use_current_task(
     ecs.stop_task(cluster=cluster, task=task_arn)
 
 
-def test_launcher_regional(
+def test_launcher_cross_region(
     ecs,
     ecs_xregion,
     xregion,
     xregion_cluster_arn,
-    instance_regional,
+    subnets, 
+    security_groups,
+    instance,
     workspace,
     remote_job,
     job,
@@ -294,13 +296,18 @@ def test_launcher_regional(
     image,
     environment,
 ):
-    instance = instance_regional
 
     run = instance.create_run_for_job(
         job,
         remote_job_origin=remote_job.get_remote_origin(),
         job_code_origin=remote_job.get_python_origin(),
-        tags={"region": xregion},
+        tags={
+            "ecs/region": xregion,
+            "ecs/cluster": xregion_cluster_arn,
+            "ecs/security_groups": security_groups,
+            "ecs/subnets": subnets,
+            "ecs/assign_public_ip": "True",
+        },
     )
     initial_task_definitions = ecs.list_task_definitions()["taskDefinitionArns"]
     initial_tasks_xregion = ecs.list_tasks(cluster=xregion_cluster_arn)["taskArns"]

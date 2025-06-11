@@ -64,7 +64,7 @@ from dagster_aws.ecs.utils import (
 )
 from dagster_aws.secretsmanager import get_secrets_from_arns
 
-Tags = namedtuple("Tags", ["arn", "cluster", "cpu", "memory"])
+Tags = namedtuple("Tags", ["arn", "cluster", "cpu", "memory", "region", "security_groups", "subnets", "assign_public_ip"])
 
 RUNNING_STATUSES = [
     "PROVISIONING",
@@ -125,7 +125,6 @@ class EcsRunLauncher(RunLauncher[T_DagsterInstance], ConfigurableClass):
         run_ecs_tags: Optional[list[dict[str, Optional[str]]]] = None,
         propagate_tags: Optional[dict[str, Any]] = None,
         task_definition_prefix: str = "run",
-        regional: Optional[dict[str, dict[str, Any]]] = None,
     ):
         self._inst_data = inst_data
         self.ecs = boto3.client("ecs")
@@ -139,9 +138,6 @@ class EcsRunLauncher(RunLauncher[T_DagsterInstance], ConfigurableClass):
             len(self._task_definition_prefix) <= 16,
             "Task definition prefix must be no more than 16 characters",
         )
-
-        self._regional = regional
-        # TODO validation for regional
 
         self.task_definition = None
         self.task_definition_dict = {}
@@ -354,38 +350,6 @@ class EcsRunLauncher(RunLauncher[T_DagsterInstance], ConfigurableClass):
                     "The container name to use when launching new tasks. Defaults to 'run'."
                 ),
             ),
-            "regional": Field(
-                Map(
-                    key_type=str,
-                    inner_type=Shape(
-                        {
-                            "cluster": Field(
-                                StringSource,
-                                is_required=True,
-                                description="ARN of the ECS cluster.",
-                            ),
-                            "subnets": Field(
-                                Array(StringSource),
-                                is_required=True,
-                                description="List of subnet IDs (at least one required).",
-                            ),
-                            "security_groups": Field(
-                                Array(StringSource),
-                                is_required=True,
-                                description="List of security group IDs (at least one if provided).",
-                            ),
-                            "assign_public_ip": Field(
-                                StringSource,
-                                is_required=False,
-                                default_value="DISABLED",
-                                description="Whether to request the assignment of public IP",
-                            ),
-                        }
-                    ),
-                ),
-                is_required=False,
-                description="Per-region cluster configuration. Each key must be an AWS region name.",
-            ),
             "secrets": Field(
                 Array(
                     ScalarUnion(
@@ -520,8 +484,12 @@ class EcsRunLauncher(RunLauncher[T_DagsterInstance], ConfigurableClass):
         cluster = tags.get("ecs/cluster")
         cpu = tags.get("ecs/cpu")
         memory = tags.get("ecs/memory")
+        region = tags.get("ecs/region")
+        security_groups = tags.get("ecs/security_groups")
+        subnets = tags.get("ecs/subnets")
+        assign_public_ip = tags.get("ecs/assign_public_ip")
 
-        return Tags(arn, cluster, cpu, memory)
+        return Tags(arn, cluster, cpu, memory, region, security_groups, subnets, assign_public_ip)
 
     def _get_command_args(self, run_args: ExecuteRunArgs, context: LaunchRunContext):
         return run_args.get_command_args()
@@ -555,22 +523,21 @@ class EcsRunLauncher(RunLauncher[T_DagsterInstance], ConfigurableClass):
 
         # TODO remove following if block after PR is merged to upstream
         warnings.warn(f"run tags: ${run.tags}")
-        if run.tags and run.tags.get("xregion_hardcode", "False") == "True":
-            self._regional = {
-                "eu-north-1": {
-                    "assign_public_ip": "DISABLED",
-                    "cluster": "arn:aws:ecs:eu-north-1:851725506399:cluster/dagster-compute-cluster-eu-north-1",
-                    "security_groups": ["sg-0adcec1865a5b470f"],
-                    "subnets": ["subnet-047d5fe22795a8008"],
-                }
-            }
-            warnings.warn(f"Injected hardcoded xregion config: ${self._regional}")
-
-        if self._regional:
-            check.invariant(
-                "region" in run.tags, "Cross-region requires @job to specify 'region' tag"
-            )
-            self._cross_region = cast("RegionName", run.tags["region"])
+        if run.tags and run.tags.get("ecs/region"):
+            self._regional = True
+            # self._regional = {
+            #     "eu-north-1": {
+            #         "assign_public_ip": "DISABLED",
+            #         "cluster": "arn:aws:ecs:eu-north-1:851725506399:cluster/dagster-compute-cluster-eu-north-1",
+            #         "security_groups": ["sg-0adcec1865a5b470f"],
+            #         "subnets": ["subnet-047d5fe22795a8008"],
+            #     }
+            # }
+            check.invariant("ecs/cluster" in run.tags, "Cross-region requires @job to specify 'ecs/cluster' tag")
+            check.invariant("ecs/security_groups" in run.tags, "Cross-region requires @job to specify 'ecs/security_groups' tag")
+            check.invariant("ecs/subnets" in run.tags, "Cross-region requires @job to specify 'ecs/subnets' tag")
+            check.invariant("ecs/assign_public_ip" in run.tags, "Cross-region requires @job to specify 'ecs/assign_public_ip' tag")
+            self._cross_region = cast("RegionName", run.tags["ecs/region"])
 
         job_origin = check.not_none(context.job_code_origin)
 
@@ -638,16 +605,17 @@ class EcsRunLauncher(RunLauncher[T_DagsterInstance], ConfigurableClass):
             del run_task_kwargs["networkConfiguration"]
 
         if self._regional:
-            regional_config = self._regional[self._cross_region]  # pyright: ignore [reportArgumentType]
+            #please test if possible to get ecs tags directly as run.tags["ecs/region"] 
+            # or maybe they arrived to run_task_kwargs
             run_task_kwargs["networkConfiguration"] = {
                 "awsvpcConfiguration": {
-                    "subnets": regional_config["subnets"],
-                    "securityGroups": regional_config["security_groups"],
-                    "assignPublicIp": regional_config["assign_public_ip"],
+                    "subnets": run.tags["ecs/subnets"].split(",")[0], # for starters let's take 1st element
+                    "securityGroups": run.tags["ecs/security_groups"].split(",")[0], # for starters let's take 1st element
+                    "assignPublicIp": "ENABLED" if run.tags["ecs/assign_public_ip"] else "DISABLED",
                 }
             }
-            run_task_kwargs["cluster"] = regional_config["cluster"]
-            run_task_kwargs["tags"].append({"key": "region", "value": run.tags["region"]})
+            run_task_kwargs["cluster"] = run.tags["ecs/cluster"]
+            run_task_kwargs["tags"].append({"key": "region", "value": run.tags["ecs/region"]})
 
         # Run a task using the same network configuration as this processes's task.
         task = backoff(
@@ -740,9 +708,7 @@ class EcsRunLauncher(RunLauncher[T_DagsterInstance], ConfigurableClass):
             return False
 
         ecs_client = (
-            self._get_ecs_client(cast("RegionName", run.tags.get("region", {})))
-            if self._regional
-            else self.ecs
+            self._get_ecs_client(tags.region) if tags.region else self.ecs
         )
         tasks = ecs_client.describe_tasks(tasks=[tags.arn], cluster=tags.cluster).get("tasks")
         if not tasks:
@@ -989,8 +955,7 @@ class EcsRunLauncher(RunLauncher[T_DagsterInstance], ConfigurableClass):
         if not (tags.arn and tags.cluster):
             return CheckRunHealthResult(WorkerStatus.UNKNOWN, "", run_worker_id=run_worker_id)
 
-        if self._regional:
-            region = cast("RegionName", run.tags.get("region", None))
+        if region := tags.region:
             ecs_client = self._get_ecs_client(region)
             logs_client = boto3.client("logs", region_name=region)
         else:
